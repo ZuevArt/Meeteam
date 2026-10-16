@@ -1,0 +1,11 @@
+.DS_Store
+data/state.json
+data/state.json.tmp
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
+coverage.out
+artifacts/
+
