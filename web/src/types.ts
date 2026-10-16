@@ -31,6 +31,8 @@ export type Source = {
   last_attempt_at?: string;
   last_success_at?: string;
   last_error?: string;
+  test_scenario?: string;
+  test_set_at?: string;
   fetched_count: number;
   valid_count: number;
   rejected_count: number;

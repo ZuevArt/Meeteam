@@ -80,6 +80,8 @@ type SourceState struct {
 	LastAttemptAt  *time.Time `json:"last_attempt_at,omitempty"`
 	LastSuccessAt  *time.Time `json:"last_success_at,omitempty"`
 	LastError      string     `json:"last_error,omitempty"`
+	TestScenario   string     `json:"test_scenario,omitempty"`
+	TestSetAt      *time.Time `json:"test_set_at,omitempty"`
 	FetchedCount   int        `json:"fetched_count"`
 	ValidCount     int        `json:"valid_count"`
 	RejectedCount  int        `json:"rejected_count"`

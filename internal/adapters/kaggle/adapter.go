@@ -20,6 +20,7 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 
+	"meeteam/internal/browser"
 	"meeteam/internal/model"
 )
 
@@ -693,26 +694,5 @@ func truncateRunes(value string, limit int) string {
 }
 
 func resolveChromePath(configured string) (string, error) {
-	configured = strings.TrimSpace(configured)
-	if configured != "" {
-		if info, err := os.Stat(configured); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
-			return configured, nil
-		}
-		return "", fmt.Errorf("configured Chrome executable was not found: %s", configured)
-	}
-	for _, name := range []string{"google-chrome", "google-chrome-stable", "chromium", "chromium-browser"} {
-		if path, err := exec.LookPath(name); err == nil {
-			return path, nil
-		}
-	}
-	for _, path := range []string{
-		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-		"/Applications/Chromium.app/Contents/MacOS/Chromium",
-		"/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-	} {
-		if info, err := os.Stat(path); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
-			return path, nil
-		}
-	}
-	return "", errors.New("Chrome or Chromium was not found; set CHROME_BIN to the browser executable")
+	return browser.ResolveChromePath(configured)
 }

@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,6 +23,7 @@ import (
 	"meeteam/internal/adapters/hacklist"
 	"meeteam/internal/adapters/kaggle"
 	"meeteam/internal/importer"
+	"meeteam/internal/lab"
 	"meeteam/internal/model"
 	"meeteam/internal/store"
 )
@@ -33,10 +34,12 @@ type application struct {
 	store        *store.FileStore
 	logger       *slog.Logger
 	runMu        sync.Mutex
+	labEnabled   bool
 }
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	httpAddr := envOr("HTTP_ADDR", "127.0.0.1:8080")
 	statePath := envOr("STATE_FILE", "data/state.json")
 	fileStore, err := store.NewFileStore(statePath)
 	if err != nil {
@@ -57,7 +60,8 @@ func main() {
 		MinDelay:    time.Duration(envInt("IMPORT_DELAY_MS", 250)) * time.Millisecond,
 	})
 	hackathonRadarAdapter := hackathonradar.New(hackathonradar.Config{
-		MinDelay: time.Duration(envInt("IMPORT_DELAY_MS", 250)) * time.Millisecond,
+		ChromePath: envOr("CHROME_BIN", ""),
+		MinDelay:   time.Duration(envInt("IMPORT_DELAY_MS", 250)) * time.Millisecond,
 	})
 	kaggleAdapter := kaggle.New(kaggle.Config{
 		ChromePath:  envOr("CHROME_BIN", ""),
@@ -92,6 +96,7 @@ func main() {
 		adapterOrder: adapterOrder,
 		store:        fileStore,
 		logger:       logger,
+		labEnabled:   isLoopbackBind(httpAddr) && envBool("LAB_ENABLED", true),
 	}
 
 	mux := http.NewServeMux()
@@ -100,10 +105,12 @@ func main() {
 	mux.HandleFunc("GET /api/sources", app.handleSources)
 	mux.HandleFunc("GET /api/import-runs", app.handleRuns)
 	mux.HandleFunc("POST /api/imports/{source}", app.handleImport)
+	mux.HandleFunc("POST /api/lab/run", app.handleLabRun)
+	mux.HandleFunc("PUT /api/lab/scenarios/{source}", app.handleLabScenario)
 	mux.Handle("/", staticHandler(envOr("WEB_DIST", "web/dist")))
 
 	server := &http.Server{
-		Addr:              envOr("HTTP_ADDR", "127.0.0.1:8080"),
+		Addr:              httpAddr,
 		Handler:           requestLogger(logger, mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -137,45 +144,71 @@ func (app *application) runImport(ctx context.Context, adapter importer.Adapter)
 	}
 	defer app.runMu.Unlock()
 
-	source := adapter.Source()
-	started := time.Now().UTC()
-	pending := model.ImportRun{SourceID: source.ID, StartedAt: started, Status: "running"}
-	if err := app.store.MarkRunning(source, pending); err != nil {
-		return model.ImportRun{}, err
+	if scenario := app.store.TestScenario(adapter.Source().ID); lab.IsFaultScenario(scenario) {
+		adapter = lab.FaultAdapter{Adapter: adapter, Scenario: scenario}
 	}
+	return importer.Run(ctx, adapter, app.store)
+}
 
-	result, fetchErr := adapter.Fetch(ctx)
-	if result.StartedAt.IsZero() {
-		result.StartedAt = started
+func (app *application) handleLabScenario(w http.ResponseWriter, request *http.Request) {
+	if !app.labEnabled || !requestIsLoopback(request.RemoteAddr) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"message": "diagnostic lab is local only"})
+		return
 	}
-	if result.FinishedAt.IsZero() {
-		result.FinishedAt = time.Now().UTC()
+	sourceID := request.PathValue("source")
+	if _, ok := app.adapters[sourceID]; !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"message": "unknown source"})
+		return
 	}
-	if fetchErr != nil {
-		failed := model.ImportRun{
-			ID:            fmt.Sprintf("%s-%d", source.ID, result.StartedAt.UnixNano()),
-			SourceID:      source.ID,
-			StartedAt:     result.StartedAt,
-			FinishedAt:    result.FinishedAt,
-			Status:        "failed",
-			FetchedCount:  result.FetchedCount,
-			ValidCount:    result.ValidCount,
-			RejectedCount: len(result.Rejected),
-			ErrorCode:     "source_import_failed",
-			ErrorSummary:  fetchErr.Error(),
-			Rejected:      result.Rejected,
-		}
-		if err := app.store.ApplyFailure(source, failed); err != nil {
-			return failed, fmt.Errorf("record failed import: %w", err)
-		}
-		return failed, fetchErr
+	var input struct {
+		Scenario string `json:"scenario"`
 	}
-
-	run, err := app.store.ApplySuccess(result)
+	decoder := json.NewDecoder(http.MaxBytesReader(w, request.Body, 4096))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil || (input.Scenario != "" && !lab.IsFaultScenario(input.Scenario)) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "unknown test scenario"})
+		return
+	}
+	source, err := app.store.SetTestScenario(sourceID, input.Scenario)
 	if err != nil {
-		return run, err
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": err.Error()})
+		return
 	}
-	return run, nil
+	writeJSON(w, http.StatusOK, map[string]any{"source": source})
+}
+
+func (app *application) handleLabRun(w http.ResponseWriter, request *http.Request) {
+	if !app.labEnabled || !requestIsLoopback(request.RemoteAddr) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"message": "diagnostic lab is local only"})
+		return
+	}
+	var input lab.Request
+	if err := json.NewDecoder(http.MaxBytesReader(w, request.Body, 4096)).Decode(&input); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "invalid lab request"})
+		return
+	}
+	if _, ok := app.adapters[input.SourceID]; !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "unknown source"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), 10*time.Second)
+	defer cancel()
+	report, err := lab.Run(ctx, input)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+func isLoopbackBind(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	return err == nil && (host == "localhost" || net.ParseIP(host).IsLoopback())
+}
+
+func requestIsLoopback(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	return err == nil && net.ParseIP(host).IsLoopback()
 }
 
 func (app *application) handleHealth(w http.ResponseWriter, _ *http.Request) {

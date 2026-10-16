@@ -25,6 +25,14 @@ type FileStore struct {
 	state persistedState
 }
 
+// NewMemoryStore uses the production state transitions without writing a file.
+func NewMemoryStore() *FileStore {
+	return &FileStore{state: persistedState{
+		Events:  make(map[string]model.Event),
+		Sources: make(map[string]model.SourceState),
+	}}
+}
+
 func NewFileStore(path string) (*FileStore, error) {
 	s := &FileStore{
 		path: path,
@@ -73,6 +81,31 @@ func (s *FileStore) EnsureSources(sources []model.SourceState) error {
 	return s.persistLocked()
 }
 
+// SetTestScenario persists a local fault selected in the parser lab.
+func (s *FileStore) SetTestScenario(sourceID, scenario string) (model.SourceState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	source, ok := s.state.Sources[sourceID]
+	if !ok {
+		return model.SourceState{}, fmt.Errorf("unknown source: %s", sourceID)
+	}
+	source.TestScenario = scenario
+	if scenario == "" {
+		source.TestSetAt = nil
+	} else {
+		now := time.Now().UTC()
+		source.TestSetAt = &now
+	}
+	s.state.Sources[sourceID] = source
+	return source, s.persistLocked()
+}
+
+func (s *FileStore) TestScenario(sourceID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.Sources[sourceID].TestScenario
+}
+
 func (s *FileStore) MarkRunning(source model.SourceState, run model.ImportRun) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -105,7 +138,9 @@ func (s *FileStore) ApplySuccess(result model.ImportResult) (model.ImportRun, er
 	source.ID = result.SourceID
 	source.Enabled = true
 	source.LastAttemptAt = &result.StartedAt
-	source.LastSuccessAt = &result.FinishedAt
+	if result.ValidCount > 0 {
+		source.LastSuccessAt = &result.FinishedAt
+	}
 	source.FetchedCount = result.FetchedCount
 	source.ValidCount = result.ValidCount
 	source.RejectedCount = len(result.Rejected)
@@ -196,6 +231,9 @@ func (s *FileStore) appendRunLocked(run model.ImportRun) {
 }
 
 func (s *FileStore) persistLocked() error {
+	if s.path == "" {
+		return nil
+	}
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return fmt.Errorf("create state directory: %w", err)
 	}

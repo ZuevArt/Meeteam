@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { Event, ImportRun, Source } from "./types";
+import type { Event, Source } from "./types";
 
 const DATE_FORMAT = new Intl.DateTimeFormat("ru-RU", {
   day: "numeric",
@@ -20,6 +20,17 @@ const formatLabels: Record<string, string> = {
   online: "Онлайн",
   offline: "Офлайн",
   hybrid: "Гибрид",
+};
+
+const testScenarioLabels: Record<string, string> = {
+  unavailable: "HTTP 503",
+  forbidden: "HTTP 403",
+  rate_limited: "HTTP 429",
+  timeout: "тайм-аут",
+  changed_format: "другой формат",
+  changed_field: "изменённые поля",
+  invalid_event: "повреждённая карточка",
+  empty: "пустой ответ",
 };
 
 async function getJSON<T>(url: string): Promise<T> {
@@ -49,7 +60,6 @@ function relativeFreshness(value?: string) {
 function App() {
   const [events, setEvents] = useState<Event[]>([]);
   const [sources, setSources] = useState<Source[]>([]);
-  const [lastRun, setLastRun] = useState<ImportRun | null>(null);
   const [query, setQuery] = useState("");
   const [format, setFormat] = useState("all");
   const [loading, setLoading] = useState(true);
@@ -59,14 +69,12 @@ function App() {
   const load = async (quiet = false) => {
     if (!quiet) setLoading(true);
     try {
-      const [eventPayload, sourcePayload, runPayload] = await Promise.all([
+      const [eventPayload, sourcePayload] = await Promise.all([
         getJSON<{ events: Event[] }>("/api/events"),
         getJSON<{ sources: Source[] }>("/api/sources"),
-        getJSON<{ runs: ImportRun[] }>("/api/import-runs"),
       ]);
       setEvents(eventPayload.events ?? []);
       setSources(sourcePayload.sources ?? []);
-      setLastRun(runPayload.runs?.[0] ?? null);
       setError("");
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Не удалось получить данные");
@@ -115,9 +123,9 @@ function App() {
           .includes(normalizedQuery);
       })
       .sort((a, b) => {
-        const left = a.registration_deadline_at ?? a.listing_expires_at ?? a.end_at ?? a.start_at ?? "9999";
-        const right = b.registration_deadline_at ?? b.listing_expires_at ?? b.end_at ?? b.start_at ?? "9999";
-        return left.localeCompare(right);
+        const left = a.start_at ?? "9999";
+        const right = b.start_at ?? "9999";
+        return left.localeCompare(right) || a.id.localeCompare(b.id);
       });
   }, [events, format, query]);
 
@@ -130,6 +138,11 @@ function App() {
   const importedSourceCount = orderedSources.filter((source) => Boolean(source.last_success_at)).length;
   const staleSources = orderedSources.filter((source) => source.last_success_at
     && Date.now() - new Date(source.last_success_at).getTime() > 48 * 60 * 60 * 1000);
+  const lastSuccessfulParse = orderedSources
+    .map((source) => source.last_success_at)
+    .filter((value): value is string => Boolean(value))
+    .sort()
+    .at(-1);
 
   return (
     <div className="app-shell">
@@ -138,6 +151,7 @@ function App() {
           <span className="brand-mark">M</span>
           <span>Meeteam</span>
         </a>
+        <a className="topbar-link" href="/parser-lab">Лаборатория парсера <span aria-hidden="true">↗</span></a>
       </header>
 
       <main id="top">
@@ -165,28 +179,27 @@ function App() {
               const isImported = Boolean(source.last_success_at);
               const indicatorClass = isRefreshing
                 ? "is-running"
-                : isImported
-                  ? "is-imported"
-                  : source.status === "failed"
-                    ? "is-failed"
-                    : "is-pending";
+                : source.status === "failed"
+                  ? "is-failed"
+                  : source.status === "partial"
+                    ? "is-partial"
+                    : isImported ? "is-imported" : "is-pending";
               const indicatorLabel = isRefreshing
                 ? "Импорт выполняется"
-                : isImported
-                  ? "Источник импортирован"
-                  : source.status === "failed"
-                    ? "Последняя попытка не удалась"
-                    : "Источник ещё не импортирован";
+                : source.status === "failed" ? "Последняя попытка не удалась"
+                  : source.status === "partial" ? "Импорт завершился с предупреждением"
+                    : isImported ? "Источник импортирован" : "Источник ещё не импортирован";
               return (
-                <article className={`source-console ${stale ? "is-stale" : ""}`} key={source.id}>
+                <article className={`source-console ${stale ? "is-stale" : ""} ${source.test_scenario ? "has-test-scenario" : ""}`} key={source.id}>
                   <div className="console-primary">
                     <span className={`source-state ${indicatorClass}`} title={indicatorLabel} aria-label={indicatorLabel}>
-                      {isRefreshing ? <span className="source-spinner" /> : isImported ? <CheckIcon /> : source.status === "failed" ? "!" : "·"}
+                      {isRefreshing ? <span className="source-spinner" /> : source.status === "failed" || source.status === "partial" ? "!" : isImported ? <CheckIcon /> : "·"}
                     </span>
                     <strong>{source.name}</strong>
                     <span className="console-meta">
                       Последний успех: {relativeFreshness(source.last_success_at)}
                     </span>
+                    {source.test_scenario && <span className="console-test">Тестовый сбой включён: {testScenarioLabels[source.test_scenario] ?? source.test_scenario}</span>}
                   </div>
                   <div className="console-stats" aria-label={`Статистика импорта ${source.name}`}>
                     <div>
@@ -226,6 +239,11 @@ function App() {
           <div className="notice error" role="alert" key={source.id}>
             {source.name}: последний запуск не удался. Лента продолжает показывать последнюю успешную версию.
             {source.last_error && <span>{source.last_error}</span>}
+          </div>
+        ))}
+        {orderedSources.filter((source) => source.status === "partial").map((source) => (
+          <div className="notice warning" role="status" key={source.id}>
+            {source.name}: последний импорт завершился с предупреждением; отклонено карточек: {source.rejected_count}.
           </div>
         ))}
         {error && <div className="notice error" role="alert">{error}</div>}
@@ -330,12 +348,6 @@ function App() {
                       </a>
                     </div>
 
-                    <details className="diagnostics">
-                      <summary>Как распознана карточка</summary>
-                      <ul>
-                        {(event.parsing_notes ?? []).map((note) => <li key={note}>{note}</li>)}
-                      </ul>
-                    </details>
                   </div>
                 </article>
               ))}
@@ -345,7 +357,7 @@ function App() {
 
         <footer>
           <span>Meeteam · вертикальный срез парсера</span>
-          <span>{lastRun ? `Последний цикл: ${DATE_TIME_FORMAT.format(new Date(lastRun.finished_at))}` : "Циклов импорта пока нет"}</span>
+          <span>{lastSuccessfulParse ? `Последний успешный парсинг: ${DATE_TIME_FORMAT.format(new Date(lastSuccessfulParse))}` : "Успешного парсинга пока нет"}</span>
         </footer>
       </main>
     </div>

@@ -1,6 +1,7 @@
 package hackathonradar
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,12 +12,15 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"meeteam/internal/browser"
 	"meeteam/internal/model"
 )
 
@@ -37,6 +41,7 @@ var (
 type Config struct {
 	Client     *http.Client
 	CatalogURL string
+	ChromePath string
 	MinDelay   time.Duration
 	MaxPages   int
 	Now        func() time.Time
@@ -45,6 +50,8 @@ type Config struct {
 type Adapter struct {
 	client     *http.Client
 	catalogURL string
+	chromePath string
+	useBrowser bool
 	minDelay   time.Duration
 	maxPages   int
 	now        func() time.Time
@@ -94,6 +101,7 @@ type rawOrganizer struct {
 }
 
 func New(config Config) *Adapter {
+	useBrowser := config.Client == nil && config.CatalogURL == ""
 	if config.Client == nil {
 		config.Client = &http.Client{Timeout: 35 * time.Second}
 	}
@@ -112,6 +120,8 @@ func New(config Config) *Adapter {
 	return &Adapter{
 		client:     config.Client,
 		catalogURL: config.CatalogURL,
+		chromePath: config.ChromePath,
+		useBrowser: useBrowser,
 		minDelay:   config.MinDelay,
 		maxPages:   config.MaxPages,
 		now:        config.Now,
@@ -125,7 +135,7 @@ func (a *Adapter) Source() model.SourceState {
 		BaseURL:        "https://www.hackathonradar.com/discover",
 		Enabled:        true,
 		Status:         "never",
-		AdapterVersion: "hackathonradar-next-html-v1",
+		AdapterVersion: "hackathonradar-next-html-v2",
 	}
 }
 
@@ -216,6 +226,9 @@ func (a *Adapter) fetchPage(ctx context.Context, pageNumber int) (databasePage, 
 	query.Set("sortBy", "title")
 	query.Set("sortOrder", "asc")
 	u.RawQuery = query.Encode()
+	if a.useBrowser {
+		return a.fetchPageViaBrowser(ctx, u.String())
+	}
 
 	var body []byte
 	var lastErr error
@@ -263,6 +276,31 @@ func (a *Adapter) fetchPage(ctx context.Context, pageNumber int) (databasePage, 
 		return databasePage{}, err
 	}
 	return page, nil
+}
+
+func (a *Adapter) fetchPageViaBrowser(ctx context.Context, pageURL string) (databasePage, error) {
+	path, err := browser.ResolveChromePath(a.chromePath)
+	if err != nil {
+		return databasePage{}, err
+	}
+	profile, err := os.MkdirTemp("", "meeteam-radar-chrome-")
+	if err != nil {
+		return databasePage{}, fmt.Errorf("create Chrome profile: %w", err)
+	}
+	defer os.RemoveAll(profile)
+	renderCtx, cancel := context.WithTimeout(ctx, 22*time.Second)
+	defer cancel()
+	command := exec.CommandContext(renderCtx, path,
+		"--headless", "--disable-javascript", "--disable-gpu", "--no-sandbox", "--disable-background-networking",
+		"--virtual-time-budget=12000", "--dump-dom", "--user-data-dir="+profile, pageURL,
+	)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	body, err := command.Output()
+	if err != nil {
+		return databasePage{}, fmt.Errorf("Chrome render failed: %w: %s", err, truncateRunes(cleanText(stderr.String()), 220))
+	}
+	return parseDatabaseHTML(body)
 }
 
 func parseDatabaseHTML(body []byte) (databasePage, error) {
