@@ -1,0 +1,20 @@
+# Disposable Quest 7 database. Local loopback only; no production credentials.
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: meeteam
+      POSTGRES_DB: meeteam_quest7
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - quest7_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meeteam -d meeteam_quest7"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+volumes:
+  quest7_pgdata:

@@ -8,4 +8,7 @@ web/vite.config.js
 web/vite.config.d.ts
 coverage.out
 artifacts/
+.quest7-local/
+backups/
+*.dump
 
